@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>엑셀 값 필터</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1d2330; --muted:#6b7280; --line:#dde1e7; --accent:#1f7a4d; --head:#eef1f4; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14171c; --card:#1d2128; --text:#e6e8eb; --muted:#9aa1ab; --line:#333a44; --accent:#3fb37a; --head:#262b33; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family: system-ui, "Malgun Gothic", sans-serif; }
+  main { max-width:1100px; margin:32px auto; padding:0 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px; margin-bottom:16px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  h2 { font-size:15px; margin:0 0 12px; }
+  p.sub { color:var(--muted); margin:0 0 16px; font-size:14px; }
+  .drop { border:2px dashed var(--line); border-radius:10px; padding:28px 16px; text-align:center; cursor:pointer; color:var(--muted); }
+  .drop.over { border-color:var(--accent); color:var(--accent); }
+  .drop strong { color:var(--text); }
+  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:8px; }
+  select, input[type=text] { padding:7px 9px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--text); font-size:14px; }
+  input[type=text] { flex:1; min-width:140px; }
+  button { padding:8px 14px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--text); font-size:14px; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  label.check { font-size:14px; display:inline-flex; gap:6px; align-items:center; }
+  .hidden { display:none; }
+  #stats { font-size:14px; color:var(--muted); margin:8px 0; }
+  .tableWrap { overflow:auto; max-height:60vh; border:1px solid var(--line); border-radius:8px; }
+  table { border-collapse:collapse; font-size:13px; width:max-content; min-width:100%; }
+  th, td { border-bottom:1px solid var(--line); padding:6px 10px; text-align:left; white-space:nowrap; }
+  th { background:var(--head); position:sticky; top:0; }
+</style>
+</head>
+<body>
+<main>
+  <div class="card">
+    <h1>엑셀 값 필터</h1>
+    <p class="sub">파일은 브라우저 안에서만 처리되며 어디에도 업로드되지 않습니다.</p>
+    <div class="drop" id="drop">
+      <strong>엑셀 파일을 끌어다 놓거나 클릭해서 선택</strong><br>
+      <span id="fileName">.xlsx, .xls, .csv</span>
+    </div>
+    <input type="file" id="file" accept=".xlsx,.xls,.xlsm,.csv" hidden>
+  </div>
+
+  <div class="card hidden" id="filterCard">
+    <h2>필터 조건</h2>
+    <div class="row">
+      <select id="sheet"></select>
+      <label class="check"><input type="checkbox" id="hasHeader" checked> 첫 행을 머리글로 사용</label>
+      <label class="check"><input type="checkbox" id="matchAll" checked> 모든 조건 만족 (해제 시 하나라도 만족)</label>
+    </div>
+    <div id="conditions"></div>
+    <div class="row">
+      <button id="addCond">+ 조건 추가</button>
+      <button id="reset">조건 초기화</button>
+    </div>
+  </div>
+
+  <div class="card hidden" id="resultCard">
+    <div class="row" style="justify-content:space-between">
+      <h2 style="margin:0">결과</h2>
+      <button class="primary" id="save">필터 결과를 엑셀로 저장</button>
+    </div>
+    <div id="stats"></div>
+    <div class="tableWrap"><table id="table"></table></div>
+  </div>
+</main>
+
+<datalist id="valueList"></datalist>
+
+<script>
+const OPS = [
+  ['contains', '포함'],
+  ['notContains', '포함하지 않음'],
+  ['eq', '같음'],
+  ['ne', '같지 않음'],
+  ['starts', '시작 문자'],
+  ['ends', '끝 문자'],
+  ['gt', '보다 큼 (>)'],
+  ['gte', '이상 (≥)'],
+  ['lt', '보다 작음 (<)'],
+  ['lte', '이하 (≤)'],
+  ['blank', '비어 있음'],
+  ['notBlank', '비어 있지 않음'],
+];
+const NO_VALUE_OPS = ['blank', 'notBlank'];
+const PREVIEW_LIMIT = 500;
+
+const $ = id => document.getElementById(id);
+let workbook = null;
+let baseName = 'result';
+let header = [];
+let body = [];
+let filtered = [];
+
+const isBlank = v => v === null || v === undefined || (typeof v === 'string' && v.trim() === '');
+const toText = v => {
+  if (isBlank(v)) return '';
+  if (v instanceof Date) return v.toISOString().slice(0, 10);
+  return String(v);
+};
+const toNum = v => {
+  if (v instanceof Date) return v.getTime();
+  if (typeof v === 'number') return v;
+  const n = Number(String(v).replace(/,/g, '').trim());
+  return isBlank(v) || isNaN(n) ? null : n;
+};
+// 숫자 비교가 안 되면 날짜(YYYY-MM-DD 등)로 다시 시도
+const toComparable = v => {
+  const n = toNum(v);
+  if (n !== null) return n;
+  const d = typeof v === 'string' ? Date.parse(v) : NaN;
+  return isNaN(d) ? null : d;
+};
+
+function test(cell, op, value) {
+  const a = toText(cell).toLowerCase();
+  const b = String(value ?? '').trim().toLowerCase();
+  switch (op) {
+    case 'contains': return a.includes(b);
+    case 'notContains': return !a.includes(b);
+    case 'eq': return toNum(cell) !== null && toNum(b) !== null ? toNum(cell) === toNum(b) : a === b;
+    case 'ne': return toNum(cell) !== null && toNum(b) !== null ? toNum(cell) !== toNum(b) : a !== b;
+    case 'starts': return a.startsWith(b);
+    case 'ends': return a.endsWith(b);
+    case 'blank': return isBlank(cell);
+    case 'notBlank': return !isBlank(cell);
+  }
+  const x = toComparable(cell);
+  const y = toComparable(b);
+  if (x === null || y === null) return false;
+  if (op === 'gt') return x > y;
+  if (op === 'gte') return x >= y;
+  if (op === 'lt') return x < y;
+  if (op === 'lte') return x <= y;
+  return true;
+}
+
+// ---------- 파일 불러오기 ----------
+const drop = $('drop');
+drop.addEventListener('click', () => $('file').click());
+drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('over'); });
+drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+drop.addEventListener('drop', e => {
+  e.preventDefault();
+  drop.classList.remove('over');
+  if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);
+});
+$('file').addEventListener('change', e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
+
+function loadFile(file) {
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      workbook = XLSX.read(new Uint8Array(e.target.result), { type: 'array', cellDates: true });
+    } catch (err) {
+      $('fileName').textContent = '파일을 읽을 수 없습니다: ' + err.message;
+      return;
+    }
+    baseName = file.name.replace(/\.[^.]+$/, '');
+    $('fileName').textContent = `${file.name} (시트 ${workbook.SheetNames.length}개)`;
+    $('sheet').innerHTML = workbook.SheetNames.map(n => `<option>${escapeHtml(n)}</option>`).join('');
+    $('filterCard').classList.remove('hidden');
+    $('resultCard').classList.remove('hidden');
+    loadSheet();
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+function loadSheet() {
+  const rows = XLSX.utils.sheet_to_json(workbook.Sheets[$('sheet').value], { header: 1, defval: null, raw: true });
+  // Math.max(...배열)은 행이 많으면 호출 스택을 넘기므로 reduce로 계산
+  const width = rows.reduce((m, r) => (r.length > m ? r.length : m), 0);
+  rows.forEach(r => { while (r.length < width) r.push(null); });
+  if ($('hasHeader').checked && rows.length) {
+    header = rows[0].map((h, i) => isBlank(h) ? `열 ${colName(i)}` : toText(h));
+    body = rows.slice(1);
+  } else {
+    header = Array.from({ length: width }, (_, i) => `열 ${colName(i)}`);
+    body = rows;
+  }
+  $('conditions').innerHTML = '';
+  addCondition();
+  apply();
+}
+
+$('sheet').addEventListener('change', loadSheet);
+$('hasHeader').addEventListener('change', loadSheet);
+$('matchAll').addEventListener('change', apply);
+
+// ---------- 조건 ----------
+function addCondition() {
+  const div = document.createElement('div');
+  div.className = 'row cond';
+  div.innerHTML = `
+    <select class="col">${header.map((h, i) => `<option value="${i}">${escapeHtml(h)}</option>`).join('')}</select>
+    <select class="op">${OPS.map(([v, t]) => `<option value="${v}">${t}</option>`).join('')}</select>
+    <input type="text" class="val" placeholder="값 입력" list="valueList">
+    <button class="del" title="조건 삭제">✕</button>`;
+  div.querySelector('.col').addEventListener('change', () => { fillValueList(div); apply(); });
+  div.querySelector('.op').addEventListener('change', () => {
+    div.querySelector('.val').classList.toggle('hidden', NO_VALUE_OPS.includes(div.querySelector('.op').value));
+    apply();
+  });
+  div.querySelector('.val').addEventListener('input', apply);
+  div.querySelector('.val').addEventListener('focus', () => fillValueList(div));
+  div.querySelector('.del').addEventListener('click', () => { div.remove(); apply(); });
+  $('conditions').appendChild(div);
+}
+
+// 선택한 열의 고유값을 자동완성 목록으로 제공
+function fillValueList(div) {
+  const c = +div.querySelector('.col').value;
+  const uniq = [...new Set(body.map(r => toText(r[c])).filter(Boolean))].slice(0, 300);
+  $('valueList').innerHTML = uniq.map(v => `<option value="${escapeHtml(v)}">`).join('');
+}
+
+$('addCond').addEventListener('click', addCondition);
+$('reset').addEventListener('click', () => { $('conditions').innerHTML = ''; addCondition(); apply(); });
+
+function getConditions() {
+  return [...document.querySelectorAll('.cond')].map(d => ({
+    col: +d.querySelector('.col').value,
+    op: d.querySelector('.op').value,
+    val: d.querySelector('.val').value,
+  })).filter(c => NO_VALUE_OPS.includes(c.op) || c.val.trim() !== '');
+}
+
+function apply() {
+  const conds = getConditions();
+  const all = $('matchAll').checked;
+  filtered = conds.length === 0 ? body : body.filter(r => {
+    const results = conds.map(c => test(r[c.col], c.op, c.val));
+    return all ? results.every(Boolean) : results.some(Boolean);
+  });
+  render();
+}
+
+// ---------- 결과 표시 / 저장 ----------
+function render() {
+  const shown = filtered.slice(0, PREVIEW_LIMIT);
+  $('table').innerHTML =
+    `<thead><tr>${header.map(h => `<th>${escapeHtml(h)}</th>`).join('')}</tr></thead>` +
+    `<tbody>${shown.map(r => `<tr>${r.map(v => `<td>${escapeHtml(toText(v))}</td>`).join('')}</tr>`).join('')}</tbody>`;
+  $('stats').textContent = `전체 ${body.length}행 중 ${filtered.length}행 일치` +
+    (filtered.length > PREVIEW_LIMIT ? ` (미리보기는 처음 ${PREVIEW_LIMIT}행만 표시, 저장 시 전체 포함)` : '');
+  $('save').disabled = filtered.length === 0;
+}
+
+$('save').addEventListener('click', () => {
+  const aoa = $('hasHeader').checked ? [header, ...filtered] : filtered;
+  const out = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(out, XLSX.utils.aoa_to_sheet(aoa, { cellDates: true }), $('sheet').value.slice(0, 31));
+  XLSX.writeFile(out, `${baseName}_필터.xlsx`);
+});
+
+function colName(i) {
+  let s = '';
+  for (i++; i > 0; i = Math.floor((i - 1) / 26)) s = String.fromCharCode(65 + (i - 1) % 26) + s;
+  return s;
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+}
+</script>
+</body>
+</html>
